@@ -14,17 +14,25 @@ services:
       - "8080:8080"
     depends_on:
       - redis
+      - sample_backend
     networks:
       - api_security_net
 
-  processor:
-    build: ./processor
-    environment:
-      - REDIS_ADDR=redis:6379
-    depends_on:
-      - redis
+  sample_backend:
+    build: ./backend
+    ports:
+      - "3000:3000"
     networks:
       - api_security_net
+
+  # processor:
+  #   build: ./processor
+  #   environment:
+  #     - REDIS_ADDR=redis:6379
+  #   depends_on:
+  #     - redis
+  #   networks:
+  #     - api_security_net
 
 networks:
   api_security_net:
