@@ -3,6 +3,7 @@
 This repository contains an MVP scaffold for a real-time threat detection system using behavioural analysis.
 
 - Gateway (Go): inline enforcement plane that validates JSON, checks a Redis blocklist, and emits telemetry to a Redis Stream.
+- Sample_Backend (Python/FastAPI): minimal backend service on port 3000 that accepts all requests and returns request details.
 - Processor (Python): out-of-band consumer that reads the telemetry stream, computes simple features, runs an Isolation Forest, and writes blocklist tokens to Redis.
 - Redis: in-memory message broker and shared state store.
 
@@ -20,10 +21,26 @@ curl -X POST http://localhost:8080/test -H "Content-Type: application/json" -H "
 
 Files of interest:
 - `gateway/main.go`
+- `backend/app.py`
 - `processor/app.py`
 - `docker-compose.yml`
 
-Pretrain model (optional, recommended for realistic behavior):
+## Backend Setup
+
+See [backend/README.md](backend/README.md) for detailed setup instructions.
+
+Quick start locally:
+```bash
+cd backend
+python3 -m venv myenv
+source myenv/bin/activate
+pip install -r requirements.txt
+python app.py
+```
+
+The backend will be available at `http://localhost:3000`
+
+## Pretrain model (optional, recommended for realistic behavior)
 
 1. Create a Python virtualenv and install dependencies:
 
