@@ -31,6 +31,9 @@ import (
 )
 
 var (
+	errMissingAuthorization     = errors.New("missing authorization header")
+	errInvalidAuthorizationBody = errors.New("invalid authorization header")
+
 	rdb    *redis.Client
 	router routers.Router
 	proxy  *httputil.ReverseProxy
@@ -44,10 +47,11 @@ var (
 
 // Configuration.
 const (
-	serverAddr         = ":8080"
-	openAPIPath        = "/etc/gateway/openapi.yaml"
-	telemetryStream    = "stream:telemetry"
-	telemetryQueueSize = 10000
+	anonymousSessionCookie = "anon_session"
+	serverAddr             = ":8080"
+	openAPIPath            = "/etc/gateway/openapi.yaml"
+	telemetryStream        = "stream:telemetry"
+	telemetryQueueSize     = 10000
 
 	// Maximum request body size.
 	maxRequestBodySize = 10 << 20 // 10 MiB
@@ -62,6 +66,8 @@ type TelemetryEvent struct {
 	EventType      string
 	Route          string
 	UserHash       string
+	SessionHash    string
+	SessionLinked  bool
 	URI            string
 	Method         string
 	IP             string
@@ -74,6 +80,7 @@ type TelemetryEvent struct {
 	RateLimitState string
 	TLSInformation string
 	ResponseSize   int64
+	Authenticated  bool
 }
 
 // responseRecorder records response metadata while still behaving
@@ -305,15 +312,16 @@ func gatewayHandler(w http.ResponseWriter, r *http.Request) {
 
 	payloadSize := int64(len(body))
 
-	// 6. Authenticate request.
-	userID, err := authenticateRequest(r)
+	// 6. Authenticate request or build an anonymous pre-login profile.
+	userID, userHash, sessionHash, authenticated, sessionLinked, err :=
+		resolveRequestIdentity(ctx, w, r)
+
 	if err != nil {
 		http.Error(
-			recorder,
-			"unauthorized",
+			w,
+			"authentication failed",
 			http.StatusUnauthorized,
 		)
-
 		enqueueTelemetry(TelemetryEvent{
 			EventType:      "authentication_failed",
 			URI:            r.URL.Path,
@@ -326,15 +334,16 @@ func gatewayHandler(w http.ResponseWriter, r *http.Request) {
 			UserAgentHash:  hashUserAgent(r.UserAgent()),
 			LatencyMicros:  time.Since(start).Microseconds(),
 			RateLimitState: "not_checked",
+			SessionLinked:  sessionLinked,
 		})
 
 		return
 	}
 
-	// 7. HMAC pseudonymisation of authenticated user ID.
-	userHash := hashUserID(userID, userHashSecret)
+	// Keep the resolved identity available for any future logging or debugging.
+	_ = userID
 
-	// 8. Check blocklist.
+	// 7. Check blocklist.
 	blockKey := fmt.Sprintf(
 		"blocklist:%s",
 		userHash,
@@ -360,6 +369,9 @@ func gatewayHandler(w http.ResponseWriter, r *http.Request) {
 			RequestID:     requestID,
 			UserAgentHash: hashUserAgent(r.UserAgent()),
 			LatencyMicros: time.Since(start).Microseconds(),
+			SessionHash:   sessionHash,
+			Authenticated: authenticated,
+			SessionLinked: sessionLinked,
 		})
 
 		return
@@ -385,12 +397,15 @@ func gatewayHandler(w http.ResponseWriter, r *http.Request) {
 			UserAgentHash:  hashUserAgent(r.UserAgent()),
 			LatencyMicros:  time.Since(start).Microseconds(),
 			RateLimitState: "not_checked",
+			SessionHash:    sessionHash,
+			Authenticated:  authenticated,
+			SessionLinked:  sessionLinked,
 		})
 
 		return
 	}
 
-	// 9. IP-based rate limiting.
+	// 8. IP-based rate limiting.
 	rateLimitKey := fmt.Sprintf(
 		"ratelimit:ip:%s",
 		ip,
@@ -423,6 +438,9 @@ func gatewayHandler(w http.ResponseWriter, r *http.Request) {
 			UserAgentHash:  hashUserAgent(r.UserAgent()),
 			LatencyMicros:  time.Since(start).Microseconds(),
 			RateLimitState: "error",
+			SessionHash:    sessionHash,
+			Authenticated:  authenticated,
+			SessionLinked:  sessionLinked,
 		})
 
 		return
@@ -452,17 +470,19 @@ func gatewayHandler(w http.ResponseWriter, r *http.Request) {
 			UserAgentHash:  hashUserAgent(r.UserAgent()),
 			LatencyMicros:  time.Since(start).Microseconds(),
 			RateLimitState: rateLimitState,
+			SessionHash:    sessionHash,
+			Authenticated:  authenticated,
+			SessionLinked:  sessionLinked,
 		})
 
 		return
 	}
 
-	// 10. OpenAPI route matching.
+	// 9. OpenAPI route matching.
 	route, pathParams, err := router.FindRoute(r)
 
 	if err != nil {
-		// kin-openapi distinguishes path-not-found and
-		// method-not-allowed route errors.
+
 		status := http.StatusNotFound
 
 		if errors.Is(err, routers.ErrMethodNotAllowed) {
@@ -488,6 +508,9 @@ func gatewayHandler(w http.ResponseWriter, r *http.Request) {
 			UserAgentHash:  hashUserAgent(r.UserAgent()),
 			LatencyMicros:  time.Since(start).Microseconds(),
 			RateLimitState: rateLimitState,
+			SessionHash:    sessionHash,
+			Authenticated:  authenticated,
+			SessionLinked:  sessionLinked,
 		})
 
 		return
@@ -503,7 +526,7 @@ func gatewayHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 11. OpenAPI request validation.
+	// 10. OpenAPI request validation.
 	input := &openapi3filter.RequestValidationInput{
 		Request:    r,
 		PathParams: pathParams,
@@ -534,25 +557,28 @@ func gatewayHandler(w http.ResponseWriter, r *http.Request) {
 			UserAgentHash:  hashUserAgent(r.UserAgent()),
 			LatencyMicros:  time.Since(start).Microseconds(),
 			RateLimitState: rateLimitState,
+			SessionHash:    sessionHash,
+			Authenticated:  authenticated,
+			SessionLinked:  sessionLinked,
 		})
 
 		return
 	}
 
-	// 12. Determine route.
+	// 11. Determine route.
 	routePath := route.Path
 
-	// 13. Proxy request to backend.
+	// 12. Proxy request to backend.
 	proxy.ServeHTTP(recorder, r)
 
-	// 14. Calculate final request metrics.
+	// 13. Calculate final request metrics.
 	elapsed := time.Since(start)
 
 	responseSize := atomic.LoadInt64(
 		&recorder.bytesWritten,
 	)
 
-	// 15. Queue telemetry.
+	// 14. Queue telemetry.
 	enqueueTelemetry(TelemetryEvent{
 		EventType:      "api_request",
 		UserHash:       userHash,
@@ -569,9 +595,12 @@ func gatewayHandler(w http.ResponseWriter, r *http.Request) {
 		RateLimitState: rateLimitState,
 		TLSInformation: tlsInformation(r),
 		ResponseSize:   responseSize,
+		SessionHash:    sessionHash,
+		Authenticated:  authenticated,
+		SessionLinked:  sessionLinked,
 	})
 
-	// 16. Gateway logging.
+	// 15. Gateway logging.
 
 	log.Printf(
 		"served request_id=%s method=%s uri=%s route=%s user=%s ip=%s status=%d payload=%d response=%d latency=%s",
@@ -588,23 +617,19 @@ func gatewayHandler(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-// authenticateRequest verifies the JWT in:
-//
-// Authorization: Bearer <token>
-//
 // This implementation expects HS256 JWTs.
 func authenticateRequest(r *http.Request) (string, error) {
 	authHeader := r.Header.Get("Authorization")
 
 	if authHeader == "" {
-		return "", errors.New("missing authorization header")
+		return "", errMissingAuthorization
 	}
 
 	parts := strings.Fields(authHeader)
 
 	if len(parts) != 2 ||
 		!strings.EqualFold(parts[0], "Bearer") {
-		return "", errors.New("invalid authorization header")
+		return "", errInvalidAuthorizationBody
 	}
 
 	tokenString := parts[1]
@@ -666,6 +691,148 @@ func authenticateRequest(r *http.Request) (string, error) {
 	}
 
 	return subject, nil
+}
+
+func resolveRequestIdentity(ctx context.Context, w http.ResponseWriter, r *http.Request) (
+	userID string,
+	userHash string,
+	sessionHash string,
+	authenticated bool,
+	sessionLinked bool,
+	err error,
+) {
+
+	userID, authErr := authenticateRequest(r)
+
+	if authErr == nil {
+		userHash = hashUserID(
+			userID,
+			userHashSecret,
+		)
+
+		// Get the stable anonymous session associated with
+		// this browser/client.
+		cookie, cookieErr := r.Cookie(anonymousSessionCookie)
+
+		if cookieErr == nil && cookie.Value != "" {
+			sessionHash = hashUserID(
+				cookie.Value,
+				userHashSecret,
+			)
+
+			if err := linkAnonymousSessionToUser(
+				ctx,
+				sessionHash,
+				userHash,
+			); err != nil {
+				return "", "", "", false, false, err
+			}
+
+			return userID, userHash, sessionHash, true, true, nil
+		}
+
+		return userID, userHash, "", true, false, nil
+	}
+
+	// Missing Authorization is allowed to continue as an
+	// anonymous request.
+	//
+	// Other authentication errors should NOT become anonymous.
+	//
+	if !errors.Is(authErr, errMissingAuthorization) {
+		return "", "", "", false, false, authErr
+	}
+	// ---------------------------------------------------------
+	// ANONYMOUS REQUEST
+	// ---------------------------------------------------------
+	sessionHash = anonymousSessionKey(w, r)
+
+	// Check whether this anonymous session has previously
+	// been linked to an authenticated user.
+	linkedUserHash, redisErr := rdb.Get(
+		ctx,
+		"anon:user:"+sessionHash,
+	).Result()
+
+	if redisErr == nil && linkedUserHash != "" {
+		// The session was previously associated with a user.
+		return "", linkedUserHash, sessionHash, false, true, nil
+	}
+
+	if redisErr != nil && !errors.Is(redisErr, redis.Nil) {
+		return "", "", "", false, false, redisErr
+	}
+
+	// Genuine anonymous session.
+	return "", "", sessionHash, false, false, nil
+}
+
+func anonymousSessionKey(w http.ResponseWriter, r *http.Request) string {
+	sessionID := getOrCreateAnonymousSession(w, r)
+
+	return hashUserID(
+		sessionID,
+		userHashSecret,
+	)
+}
+
+func getOrCreateAnonymousSession(w http.ResponseWriter, r *http.Request) string {
+	// Try to retrieve the existing anonymous session.
+	cookie, err := r.Cookie(anonymousSessionCookie)
+
+	if err == nil && cookie.Value != "" {
+		return cookie.Value
+	}
+
+	// No existing session — create a new random ID.
+	sessionID := uuid.NewString()
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     anonymousSessionCookie,
+		Value:    sessionID,
+		Path:     "/",
+		HttpOnly: true,
+
+		// Use HTTPS in production.
+		Secure: os.Getenv("ENVIRONMENT") == "production",
+
+		SameSite: http.SameSiteLaxMode,
+
+		// 24 hours.
+		MaxAge: 24 * 60 * 60,
+	})
+
+	return sessionID
+}
+
+func linkAnonymousSessionToUser(ctx context.Context, sessionHash string, userHash string) error {
+	key := "anon:user:" + sessionHash
+
+	existingUserHash, err := rdb.Get(
+		ctx,
+		key,
+	).Result()
+
+	if err == nil {
+		if existingUserHash == userHash {
+			return nil
+		}
+
+		return fmt.Errorf(
+			"anonymous session already linked to another user",
+		)
+	}
+
+	if !errors.Is(err, redis.Nil) {
+		return err
+	}
+
+	return rdb.Set(
+		ctx,
+		key,
+		userHash,
+		24*time.Hour,
+	).Err()
 }
 
 // hashUserID creates a keyed HMAC-SHA256 pseudonym.
@@ -804,6 +971,8 @@ func telemetryWorker() {
 					"event_type":       event.EventType,
 					"route":            event.Route,
 					"user_id_hash":     event.UserHash,
+					"session_hash":     event.SessionHash,
+					"session_linked":   event.SessionLinked,
 					"uri":              event.URI,
 					"method":           event.Method,
 					"ip":               event.IP,
@@ -816,6 +985,7 @@ func telemetryWorker() {
 					"rate_limit_state": event.RateLimitState,
 					"tls_information":  event.TLSInformation,
 					"response_size":    event.ResponseSize,
+					"authenticated":    event.Authenticated,
 				},
 			},
 		).Err()
