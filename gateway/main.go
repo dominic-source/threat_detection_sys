@@ -696,7 +696,10 @@ func authenticateRequest(r *http.Request) (string, error) {
 	return subject, nil
 }
 
-func resolveRequestIdentity(ctx context.Context, w http.ResponseWriter, r *http.Request) (
+func resolveRequestIdentity(
+	ctx context.Context,
+	w http.ResponseWriter,
+	r *http.Request) (
 	userID string,
 	userHash string,
 	sessionHash string,
@@ -748,7 +751,15 @@ func resolveRequestIdentity(ctx context.Context, w http.ResponseWriter, r *http.
 	// ---------------------------------------------------------
 	// ANONYMOUS REQUEST
 	// ---------------------------------------------------------
-	sessionHash = anonymousSessionKey(w, r)
+	sessionHash, err = anonymousSessionKey(
+		ctx,
+		w,
+		r,
+	)
+
+	if err != nil {
+		return "", "", "", false, false, err
+	}
 
 	// Check whether this anonymous session has previously
 	// been linked to an authenticated user.
@@ -770,21 +781,32 @@ func resolveRequestIdentity(ctx context.Context, w http.ResponseWriter, r *http.
 	return "", "", sessionHash, false, false, nil
 }
 
-func anonymousSessionKey(w http.ResponseWriter, r *http.Request) string {
-	sessionID := getOrCreateAnonymousSession(w, r)
+func anonymousSessionKey(
+	ctx context.Context,
+	w http.ResponseWriter,
+	r *http.Request) (string, error) {
+	sessionID, err := getOrCreateAnonymousSession(
+		ctx,
+		w,
+		r,
+	)
+	if err != nil {
+		return "", err
+	}
 
 	return hashUserID(
 		sessionID,
 		userHashSecret,
-	)
+	), nil
 }
 
-func getOrCreateAnonymousSession(w http.ResponseWriter, r *http.Request) string {
+func getOrCreateAnonymousSession(ctx context.Context,
+	w http.ResponseWriter, r *http.Request) (string, error) {
 	// Try to retrieve the existing anonymous session.
 	cookie, err := r.Cookie(anonymousSessionCookie)
 
 	if err == nil && cookie.Value != "" {
-		return cookie.Value
+		return cookie.Value, nil
 	}
 
 	// No existing session — create a new random ID.
@@ -805,7 +827,35 @@ func getOrCreateAnonymousSession(w http.ResponseWriter, r *http.Request) string 
 		MaxAge: 24 * 60 * 60,
 	})
 
-	return sessionID
+	sessionHash := hashUserID(
+		sessionID,
+		userHashSecret,
+	)
+
+	key := "anon:session:" + sessionHash
+
+	now := time.Now().Unix()
+
+	err = rdb.HSet(
+		ctx,
+		key,
+		"created_at", now,
+		"last_seen_at", now,
+	).Err()
+
+	if err != nil {
+		return "", err
+	}
+
+	if err := rdb.Expire(
+		ctx,
+		key,
+		24*time.Hour,
+	).Err(); err != nil {
+		return "", err
+	}
+
+	return sessionID, nil
 }
 
 func linkAnonymousSessionToUser(ctx context.Context, sessionHash string, userHash string) error {
