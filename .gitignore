@@ -1,3 +1,4 @@
 .env
 test.md
 sample_backend/myenv
+tools/__pycache__/
