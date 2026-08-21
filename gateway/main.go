@@ -192,37 +192,40 @@ func main() {
 	log.Println("OpenAPI specification loaded and validated")
 
 	// 4. Create reverse proxy
-	proxy = httputil.NewSingleHostReverseProxy(parsedBackendURL)
+	proxy = &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			// Route the request to the configured backend.
+			pr.SetURL(parsedBackendURL)
 
-	proxy.Rewrite = func(pr *httputil.ProxyRequest) {
-		// Preserve the request ID.
-		if requestID := pr.In.Header.Get("X-Request-ID"); requestID != "" {
-			pr.Out.Header.Set("X-Request-ID", requestID)
-		}
+			// Preserve the request ID.
+			if requestID := pr.In.Header.Get("X-Request-ID"); requestID != "" {
+				pr.Out.Header.Set("X-Request-ID", requestID)
+			}
 
-		// Tell the backend that this request came through the gateway.
-		pr.Out.Header.Set("X-Gateway", "api-gateway")
+			// Tell the backend that this request came through the gateway.
+			pr.Out.Header.Set("X-Gateway", "api-gateway")
 
-		// Set X-Forwarded-For, X-Forwarded-Host and X-Forwarded-Proto.
-		pr.SetXForwarded()
-	}
+			// Set trusted X-Forwarded-* headers.
+			pr.SetXForwarded()
+		},
 
-	proxy.ErrorHandler = func(
-		w http.ResponseWriter,
-		r *http.Request,
-		err error,
-	) {
-		log.Printf(
-			"backend proxy error request_id=%s error=%v",
-			r.Header.Get("X-Request-ID"),
-			err,
-		)
+		ErrorHandler: func(
+			w http.ResponseWriter,
+			r *http.Request,
+			err error,
+		) {
+			log.Printf(
+				"backend proxy error request_id=%s error=%v",
+				r.Header.Get("X-Request-ID"),
+				err,
+			)
 
-		http.Error(
-			w,
-			"backend unavailable",
-			http.StatusBadGateway,
-		)
+			http.Error(
+				w,
+				"backend unavailable",
+				http.StatusBadGateway,
+			)
+		},
 	}
 	// 5. Start telemetry queue
 
